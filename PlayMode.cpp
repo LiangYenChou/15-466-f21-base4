@@ -1,126 +1,190 @@
 #include "PlayMode.hpp"
 
-#include "LitColorTextureProgram.hpp"
 
-#include "DrawLines.hpp"
-#include "Mesh.hpp"
-#include "Load.hpp"
-#include "gl_errors.hpp"
+#include <iostream>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
+#include <fstream>
 #include "data_path.hpp"
+#include "Sound.hpp"
 
-#include <glm/gtc/type_ptr.hpp>
+#if defined(_WIN32)
+#include <filesystem>
+#else
+#include <dirent.h>
+#endif
 
-#include <random>
 
-GLuint hexapod_meshes_for_lit_color_texture_program = 0;
-Load< MeshBuffer > hexapod_meshes(LoadTagDefault, []() -> MeshBuffer const * {
-	MeshBuffer const *ret = new MeshBuffer(data_path("hexapod.pnct"));
-	hexapod_meshes_for_lit_color_texture_program = ret->make_vao_for_program(lit_color_texture_program->program);
-	return ret;
-});
+Load< std::map<std::string, Sound::Sample>> sound_samples(LoadTagDefault, []() -> std::map<std::string, Sound::Sample> const* {
+		auto map_p = new std::map<std::string, Sound::Sample>();
+		std::string base_dir = data_path("musics");
 
-Load< Scene > hexapod_scene(LoadTagDefault, []() -> Scene const * {
-	return new Scene(data_path("hexapod.scene"), [&](Scene &scene, Scene::Transform *transform, std::string const &mesh_name){
-		Mesh const &mesh = hexapod_meshes->lookup(mesh_name);
+#if defined(_WIN32)
+	for (const auto& entry : std::filesystem::directory_iterator(base_dir)) {
+		std::string path_string = entry.path().string();
+		std::string file_name = entry.path().filename().string();
+#else
+	struct dirent *entry;
+	DIR *dp;
 
-		scene.drawables.emplace_back(transform);
-		Scene::Drawable &drawable = scene.drawables.back();
-
-		drawable.pipeline = lit_color_texture_program_pipeline;
-
-		drawable.pipeline.vao = hexapod_meshes_for_lit_color_texture_program;
-		drawable.pipeline.type = mesh.type;
-		drawable.pipeline.start = mesh.start;
-		drawable.pipeline.count = mesh.count;
-
-	});
-});
-
-Load< Sound::Sample > dusty_floor_sample(LoadTagDefault, []() -> Sound::Sample const * {
-	return new Sound::Sample(data_path("dusty-floor.opus"));
-});
-
-PlayMode::PlayMode() : scene(*hexapod_scene) {
-	//get pointers to leg for convenience:
-	for (auto &transform : scene.transforms) {
-		if (transform.name == "Hip.FL") hip = &transform;
-		else if (transform.name == "UpperLeg.FL") upper_leg = &transform;
-		else if (transform.name == "LowerLeg.FL") lower_leg = &transform;
+	dp = opendir(&base_dir[0]);
+	if (dp == nullptr) {
+		std::cout<<"Cannot open "<<base_dir<<"\n";
+		throw std::runtime_error("Cannot open dir");
 	}
-	if (hip == nullptr) throw std::runtime_error("Hip not found.");
-	if (upper_leg == nullptr) throw std::runtime_error("Upper leg not found.");
-	if (lower_leg == nullptr) throw std::runtime_error("Lower leg not found.");
+	while ((entry = readdir(dp))) {
+		std::string path_string = base_dir + "/" + std::string(entry->d_name);
+		std::string file_name = std::string(entry->d_name);
+#endif
+			size_t start = 0;
+			size_t end = file_name.find(".opus");
 
-	hip_base_rotation = hip->rotation;
-	upper_leg_base_rotation = upper_leg->rotation;
-	lower_leg_base_rotation = lower_leg->rotation;
+			if(end != std::string::npos) {
+				map_p->emplace(file_name.substr(start, end), Sound::Sample(path_string));
+			}
+		}
+		return map_p;
+	});
 
-	//get pointer to camera for convenience:
-	if (scene.cameras.size() != 1) throw std::runtime_error("Expecting scene to have exactly one camera, but it has " + std::to_string(scene.cameras.size()));
-	camera = &scene.cameras.front();
+Load< Sound::Sample > load_typing_effect(LoadTagDefault, []() -> Sound::Sample const* {
+		return new Sound::Sample(data_path("musics/typing.opus"));
+	});
+Load< Sound::Sample > load_bgm(LoadTagDefault, []() -> Sound::Sample const* {
+	return new Sound::Sample(data_path("musics/bgm.opus"));
+	});
+Load< Sound::Sample > load_game_end(LoadTagDefault, []() -> Sound::Sample const* {
+	return new Sound::Sample(data_path("musics/game-end.opus"));
+	});
 
-	//start music loop playing:
-	// (note: position will be over-ridden in update())
-	leg_tip_loop = Sound::loop_3D(*dusty_floor_sample, 1.0f, get_leg_tip_position(), 10.0f);
+PlayMode::PlayMode() {
+	FT_Library library;
+	FT_Error error_lib = FT_Init_FreeType(&library);
+	if (error_lib) {
+		std::cout << "Init library failed." << std::endl;
+	}
+
+	std::string desc_font_path = data_path("Hey October.ttf");
+	FT_Error error_1 = FT_New_Face(library, &(desc_font_path[0]), 0, &desc_face);
+
+	if (error_1) {
+		std::cout<<"Error code: "<<error_1<<std::endl;
+		throw std::runtime_error("Cannot open font file");
+	}
+
+	FT_Error error_2 = FT_New_Face(library, &(desc_font_path[0]), 0, &option_face);
+	if (error_2) {
+		std::cout<<"Error code: "<<error_2<<std::endl;
+		throw std::runtime_error("Cannot open font file");
+	}
+
+	if (!desc_face || !option_face) {
+		throw std::runtime_error("Wrong font!");
+	}
+
+	scene_sen = new Sentence(desc_face, 720 / LINE_CNT); // hard code height of each line
+	for(int i=0; i<5; i++) {
+		option_sens.emplace_back(new Sentence(option_face, 720 / LINE_CNT));
+	}
+
+	load_text_scenes();
+	curr_choice = 0;
+	curr_scene = 0; // 1
+	bgm_loop = Sound::loop(*load_bgm, 0.15f);
 }
 
 PlayMode::~PlayMode() {
+
 }
 
-bool PlayMode::handle_event(SDL_Event const &evt, glm::uvec2 const &window_size) {
-
-	if (evt.type == SDL_KEYDOWN) {
-		if (evt.key.keysym.sym == SDLK_ESCAPE) {
-			SDL_SetRelativeMouseMode(SDL_FALSE);
-			return true;
-		} else if (evt.key.keysym.sym == SDLK_a) {
-			left.downs += 1;
-			left.pressed = true;
-			return true;
-		} else if (evt.key.keysym.sym == SDLK_d) {
-			right.downs += 1;
-			right.pressed = true;
-			return true;
-		} else if (evt.key.keysym.sym == SDLK_w) {
-			up.downs += 1;
-			up.pressed = true;
-			return true;
-		} else if (evt.key.keysym.sym == SDLK_s) {
-			down.downs += 1;
-			down.pressed = true;
-			return true;
-		}
-	} else if (evt.type == SDL_KEYUP) {
-		if (evt.key.keysym.sym == SDLK_a) {
-			left.pressed = false;
-			return true;
-		} else if (evt.key.keysym.sym == SDLK_d) {
-			right.pressed = false;
-			return true;
-		} else if (evt.key.keysym.sym == SDLK_w) {
-			up.pressed = false;
-			return true;
-		} else if (evt.key.keysym.sym == SDLK_s) {
-			down.pressed = false;
-			return true;
-		}
-	} else if (evt.type == SDL_MOUSEBUTTONDOWN) {
-		if (SDL_GetRelativeMouseMode() == SDL_FALSE) {
-			SDL_SetRelativeMouseMode(SDL_TRUE);
-			return true;
-		}
-	} else if (evt.type == SDL_MOUSEMOTION) {
-		if (SDL_GetRelativeMouseMode() == SDL_TRUE) {
-			glm::vec2 motion = glm::vec2(
-				evt.motion.xrel / float(window_size.y),
-				-evt.motion.yrel / float(window_size.y)
-			);
-			camera->transform->rotation = glm::normalize(
-				camera->transform->rotation
-				* glm::angleAxis(-motion.x * camera->fovy, glm::vec3(0.0f, 1.0f, 0.0f))
-				* glm::angleAxis(motion.y * camera->fovy, glm::vec3(1.0f, 0.0f, 0.0f))
-			);
-			return true;
+bool PlayMode::handle_event(SDL_Event const& evt, glm::uvec2 const& window_size) {
+	// Reference https://github.com/Dmcdominic/15-466-f20-game4/blob/menu-mode/MenuMode.cpp
+	if (!text_scenes[curr_scene].choice_descriptions.empty() &&
+			text_scenes[curr_scene].description.size() == text_scenes[curr_scene].visible_desc.size()) {
+		if (evt.type == SDL_KEYDOWN) {
+			if (evt.key.keysym.sym == SDLK_DOWN) {
+				curr_choice += 1;
+				curr_choice %= text_scenes[curr_scene].choice_descriptions.size();
+				return true;
+			}
+			else if (evt.key.keysym.sym == SDLK_UP) {
+				curr_choice -= 1;
+				if (curr_choice < 0)
+					curr_choice += (int)text_scenes[curr_scene].choice_descriptions.size();
+				return true;
+			}
+			else if (evt.key.keysym.sym == SDLK_SPACE) {
+				text_scenes[curr_scene].elapsed = 0.0f;//reset
+				text_scenes[curr_scene].visible_desc.clear();//reset
+				std::map<int, bool>::iterator it;
+				for (it = text_scenes[curr_scene].played.begin(); it != text_scenes[curr_scene].played.end(); it++) {
+					it->second = false;
+				}
+				if (have_cd && text_scenes[curr_scene].next_scene[curr_choice] == 10) {
+					text_scenes[curr_scene].next_scene[curr_choice] = 11;
+				}
+				if (have_cd && text_scenes[curr_scene].next_scene[curr_choice] == 6) {
+					text_scenes[curr_scene].next_scene[curr_choice] = 12;
+				}
+				if (curr_scene == 9 && text_scenes[curr_scene].next_scene[curr_choice] == 9) {
+					if (text_scenes[curr_scene].description.find(pc_password) != std::string::npos) {
+						pc_unlock = true;
+						text_scenes[curr_scene].next_scene[curr_choice] = 13;
+					}
+					else {
+						size_t pos = text_scenes[curr_scene].description.find("EB");
+						text_scenes[curr_scene].description.replace(pos, pc_password.length(), pc_original);
+					}
+				}
+				if (curr_scene == 8 && text_scenes[curr_scene].next_scene[curr_choice] == 8) {
+					if (text_scenes[curr_scene].description.find(door_password) != std::string::npos) {
+						text_scenes[curr_scene].next_scene[curr_choice] = 15;
+					}
+					else {
+						size_t pos = text_scenes[curr_scene].description.find("PIN:") + 5;
+						text_scenes[curr_scene].description.replace(pos, door_password.length(), door_original);
+					}
+				}
+				if (pc_unlock && text_scenes[curr_scene].next_scene[curr_choice] == 9) {
+					text_scenes[curr_scene].next_scene[curr_choice] = 13;
+				}
+				if (pc_unlock && text_scenes[curr_scene].next_scene[curr_choice] == 7) {
+					text_scenes[curr_scene].next_scene[curr_choice] = 14;
+				}
+				if (text_scenes[curr_scene].next_scene[curr_choice] == 11) {
+					bgm_loop->stop();
+				}
+				if (curr_scene == 11) {
+					bgm_loop = Sound::loop(*load_bgm, 0.15f);
+				}
+				curr_scene = text_scenes[curr_scene].next_scene[curr_choice];
+				curr_choice = 0;
+				if (curr_scene == 6) {
+					have_cd = true;
+				}
+				if (curr_scene == 15) {
+					bgm_loop->stop();
+					Sound::loop(*load_game_end, 0.2f);
+				}
+			}
+			else if (curr_scene == 9 && evt.key.keysym.sym >= 97 && evt.key.keysym.sym <= 122) {
+				Sound::play((*sound_samples).at("key_single_press"), 0.4f);
+				if (text_scenes[curr_scene].description.find("_") != std::string::npos) {
+					text_scenes[curr_scene].description[text_scenes[curr_scene].description.find("_")] = (char)(evt.key.keysym.sym - 97 + 'A');
+				}
+			}
+			else if (curr_scene == 0 && evt.key.keysym.sym >= 48 && evt.key.keysym.sym <= 57) { // curr_scene == 8
+				Sound::play((*sound_samples).at("door_pin_single_press"), 0.4f);
+				if (text_scenes[curr_scene].description.find("-") != std::string::npos) {
+					text_scenes[curr_scene].description[text_scenes[curr_scene].description.find("-")] = (char)(evt.key.keysym.sym - 48 + '0');
+				}
+			}
+			else if (curr_scene == 11 && evt.key.keysym.sym == SDLK_r) {
+				Sound::play((*sound_samples).at("code"), 1.0f);
+				if (text_scenes[curr_scene].description.find("-") != std::string::npos) {
+					text_scenes[curr_scene].description[text_scenes[curr_scene].description.find("-")] = (char)(evt.key.keysym.sym - 48 + '0');
+				}
+			}
 		}
 	}
 
@@ -128,109 +192,169 @@ bool PlayMode::handle_event(SDL_Event const &evt, glm::uvec2 const &window_size)
 }
 
 void PlayMode::update(float elapsed) {
-
-	//slowly rotates through [0,1):
-	wobble += elapsed / 10.0f;
-	wobble -= std::floor(wobble);
-
-	hip->rotation = hip_base_rotation * glm::angleAxis(
-		glm::radians(5.0f * std::sin(wobble * 2.0f * float(M_PI))),
-		glm::vec3(0.0f, 1.0f, 0.0f)
-	);
-	upper_leg->rotation = upper_leg_base_rotation * glm::angleAxis(
-		glm::radians(7.0f * std::sin(wobble * 2.0f * 2.0f * float(M_PI))),
-		glm::vec3(0.0f, 0.0f, 1.0f)
-	);
-	lower_leg->rotation = lower_leg_base_rotation * glm::angleAxis(
-		glm::radians(10.0f * std::sin(wobble * 3.0f * 2.0f * float(M_PI))),
-		glm::vec3(0.0f, 0.0f, 1.0f)
-	);
-
-	//move sound to follow leg tip position:
-	leg_tip_loop->set_position(get_leg_tip_position(), 1.0f / 60.0f);
-
-	//move camera:
 	{
+		// update scene description word
+		// check if needs to play sound
+		auto cur_len = (uint32_t)text_scenes[curr_scene].visible_desc.size();
+		if (!typing_sample && cur_len == 0) {
+			typing_sample = Sound::loop(*load_typing_effect, 0.3f);
+		}
 
-		//combine inputs into a move:
-		constexpr float PlayerSpeed = 30.0f;
-		glm::vec2 move = glm::vec2(0.0f);
-		if (left.pressed && !right.pressed) move.x =-1.0f;
-		if (!left.pressed && right.pressed) move.x = 1.0f;
-		if (down.pressed && !up.pressed) move.y =-1.0f;
-		if (!down.pressed && up.pressed) move.y = 1.0f;
+		if (typing_sample && cur_len == (uint32_t)text_scenes[curr_scene].description.size()) {
+			typing_sample->stop();
+			typing_sample = nullptr;
+		}
 
-		//make it so that moving diagonally doesn't go faster:
-		if (move != glm::vec2(0.0f)) move = glm::normalize(move) * PlayerSpeed * elapsed;
+		text_scenes[curr_scene].elapsed += elapsed;
 
-		glm::mat4x3 frame = camera->transform->make_local_to_parent();
-		glm::vec3 right = frame[0];
-		//glm::vec3 up = frame[1];
-		glm::vec3 forward = -frame[2];
+		int char_size = std::max((int)(text_scenes[curr_scene].elapsed / pop_char_interval),
+						   (int)text_scenes[curr_scene].visible_desc.size());
 
-		camera->transform->position += move.x * right + move.y * forward;
+		text_scenes[curr_scene].visible_desc = text_scenes[curr_scene].description.substr(0, char_size);
+		if (text_scenes[curr_scene].sounds.find((int)text_scenes[curr_scene].visible_desc.size()) != text_scenes[curr_scene].sounds.end()) {
+			if (!text_scenes[curr_scene].played[(int)text_scenes[curr_scene].visible_desc.size()]) {
+				Sound::play((*sound_samples).at(text_scenes[curr_scene].sounds[(int)text_scenes[curr_scene].visible_desc.size()]));
+				text_scenes[curr_scene].played[(int)text_scenes[curr_scene].visible_desc.size()] = true;
+			}
+		}
 	}
 
-	{ //update listener to camera position:
-		glm::mat4x3 frame = camera->transform->make_local_to_parent();
-		glm::vec3 right = frame[0];
-		glm::vec3 at = frame[3];
-		Sound::listener.set_position_right(at, right, 1.0f / 60.0f);
+	{
+		// last scene
+		if(text_scenes[curr_scene].description.size() == text_scenes[curr_scene].visible_desc.size() &&
+				curr_scene == 15) {
+			// last scene, show white background and "THE END"
+			ending_elapsed += elapsed;
+		}
 	}
-
-	//reset button press counters:
-	left.downs = 0;
-	right.downs = 0;
-	up.downs = 0;
-	down.downs = 0;
 }
 
-void PlayMode::draw(glm::uvec2 const &drawable_size) {
-	//update camera aspect ratio for drawable:
-	camera->aspect = float(drawable_size.x) / float(drawable_size.y);
+void PlayMode::draw(glm::uvec2 const &window_size) {
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-	//set up light type and position for lit_color_texture_program:
-	// TODO: consider using the Light(s) in the scene to do this
-	glUseProgram(lit_color_texture_program->program);
-	glUniform1i(lit_color_texture_program->LIGHT_TYPE_int, 1);
-	glUniform3fv(lit_color_texture_program->LIGHT_DIRECTION_vec3, 1, glm::value_ptr(glm::vec3(0.0f, 0.0f,-1.0f)));
-	glUniform3fv(lit_color_texture_program->LIGHT_ENERGY_vec3, 1, glm::value_ptr(glm::vec3(1.0f, 1.0f, 0.95f)));
-	glUseProgram(0);
+	if(ending_elapsed > 0.0f) {
+		float val = std::min(ending_elapsed / transition_last_sec, 1.0f);
 
-	glClearColor(0.5f, 0.5f, 0.5f, 1.0f);
+		glClearColor(val, val, val, 1.0f);
+	} else {
+		glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+	}
 	glClearDepth(1.0f); //1.0 is actually the default value to clear the depth buffer to, but FYI you can change it.
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
 	glEnable(GL_DEPTH_TEST);
 	glDepthFunc(GL_LESS); //this is the default depth comparison function, but FYI you can change it.
 
-	scene.draw(*camera);
 
+	// Reference: https://github.com/Dmcdominic/15-466-f20-game4/blob/menu-mode/MenuMode.cpp
 	{ //use DrawLines to overlay some text:
 		glDisable(GL_DEPTH_TEST);
-		float aspect = float(drawable_size.x) / float(drawable_size.y);
-		DrawLines lines(glm::mat4(
-			1.0f / aspect, 0.0f, 0.0f, 0.0f,
-			0.0f, 1.0f, 0.0f, 0.0f,
-			0.0f, 0.0f, 1.0f, 0.0f,
-			0.0f, 0.0f, 0.0f, 1.0f
-		));
 
-		constexpr float H = 0.09f;
-		lines.draw_text("Mouse motion rotates camera; WASD moves; escape ungrabs mouse",
-			glm::vec3(-aspect + 0.1f * H, -1.0 + 0.1f * H, 0.0),
-			glm::vec3(H, 0.0f, 0.0f), glm::vec3(0.0f, H, 0.0f),
-			glm::u8vec4(0x00, 0x00, 0x00, 0x00));
-		float ofs = 2.0f / drawable_size.y;
-		lines.draw_text("Mouse motion rotates camera; WASD moves; escape ungrabs mouse",
-			glm::vec3(-aspect + 0.1f * H + ofs, -1.0 + + 0.1f * H + ofs, 0.0),
-			glm::vec3(H, 0.0f, 0.0f), glm::vec3(0.0f, H, 0.0f),
-			glm::u8vec4(0xff, 0xff, 0xff, 0x00));
+		scene_sen->ClearText();
+		float scene_y_anchor = 1.0f - 2.0f / (float)LINE_CNT;
+		scene_sen->SetText(&(text_scenes[curr_scene].visible_desc[0]), 4000,
+		                   scene_desc_color,glm::vec2(-0.96f, scene_y_anchor));
+
+		for (auto s : option_sens) {
+			s->ClearText();
+		}
+
+		int lines_of_desc = (int)std::count(text_scenes[curr_scene].description.begin(),
+								 text_scenes[curr_scene].description.end(), '\n') + 1;
+		float option_y_anchor = 1.0f - (2.0f / (float)LINE_CNT) * (float)(lines_of_desc + 1);
+		for (uint32_t i = 0; i < text_scenes[curr_scene].choice_descriptions.size() && i < option_sens.size(); i++) {
+			glm::u8vec4 color = (int)i == curr_choice ? option_select_color : option_unselect_color;
+
+			option_sens[i]->SetText(&(text_scenes[curr_scene].choice_descriptions[i][0]),
+			                        3000, color, glm::vec2(-0.96f, option_y_anchor));
+			option_y_anchor -= (2.0f / (float)LINE_CNT) / 2.0f;
+		}
+
+		scene_sen->Draw(window_size);
+
+		if(text_scenes[curr_scene].description.size() == text_scenes[curr_scene].visible_desc.size()) {
+			// only draw until all scene desc appear
+			for(auto s: option_sens) {
+				s->Draw(window_size);
+			}
+		}
 	}
-	GL_ERRORS();
 }
 
-glm::vec3 PlayMode::get_leg_tip_position() {
-	//the vertex position here was read from the model in blender:
-	return lower_leg->make_local_to_world() * glm::vec4(-1.26137f, -11.861f, 0.0f, 1.0f);
+
+void PlayMode::load_text_scenes() {
+	// From https://stackoverflow.com/questions/612097/how-can-i-get-the-list-of-files-in-a-directory-using-c-or-c
+	std::string base_dir = data_path("texts");
+
+
+#if defined(_WIN32)
+	for (const auto& entry : std::filesystem::directory_iterator(base_dir)) {
+		std::string txt_path = entry.path().string();
+#else
+	struct dirent *entry;
+	DIR *dp;
+
+	dp = opendir(&base_dir[0]);
+	if (dp == nullptr) {
+		std::cout<<"Cannot open "<<base_dir<<"\n";
+		throw std::runtime_error("Cannot open dir");
+	}
+	while ((entry = readdir(dp))) {
+		std::string txt_path = base_dir + "/" + std::string(entry->d_name);
+#endif
+		std::ifstream f(txt_path);
+		std::string line;
+		if (!f.is_open()) {
+			std::cout << "Unable to open file " << txt_path << std::endl;
+			continue;
+		}
+		if (!std::getline(f, line)) {
+			std::cout << txt_path << " is an empty file! Skipped." << std::endl;
+			continue;
+		}
+		int id = std::stoi(line);
+		std::string description = "";
+
+		while (std::getline(f, line)) {
+			if (line.rfind("##", 0) == 0)
+				break;
+			if (line.rfind("&&", 0) == 0)
+				break;
+			description.append(line.append("\n"));
+		}
+		description = description.substr(0, description.size() - 1);
+		TextScene ts = { id, description };
+		while (line.rfind("##", 0) == 0) {
+			ts.next_scene.push_back(std::stoi(line.substr(2)));
+			std::string choice_des = "";
+			while (std::getline(f, line)) {
+				if (line.rfind("##", 0) == 0)
+					break;
+				if (line.rfind("&&", 0) == 0)
+					break;
+				choice_des.append(line.append("\n"));
+			}
+			choice_des = choice_des.substr(0, choice_des.size() - 1);
+			ts.choice_descriptions.push_back(choice_des);
+		}
+		while (line.rfind("&&", 0) == 0) {
+			int start_pos = std::stoi(line.substr(2));
+			if (!std::getline(f, line)) {
+				std::cout << "Music not specified!" << std::endl;
+				break;
+			}
+			ts.sounds[start_pos] = line;
+			ts.played[start_pos] = false;
+			std::getline(f, line);
+		}
+		text_scenes[id] = ts;
+		text_scenes[id].elapsed = 0.0f; // init timer
+		f.close();
+	}
+
+#if defined(_WIN32)
+#else
+	closedir(dp);
+#endif
 }
